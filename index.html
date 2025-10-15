@@ -1,2 +1,258 @@
-cd ~/work/ocean-wave-visualizer
-pbpaste > index.html
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ocean-study-wave (Chicago Focus Timer)</title>
+  <meta name="description" content="Study timer with realistic ocean & day/night driven by Chicago time. p5.js + p5.sound" />
+  <!-- p5.js & p5.sound -->
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.0/lib/p5.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.0/lib/addons/p5.sound.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; }
+    canvas { display: block; }
+    .hud {
+      position: fixed; left: 12px; bottom: 12px; z-index: 10;
+      background: rgba(10,12,18,0.55); color: #fff; backdrop-filter: blur(6px);
+      border-radius: 16px; padding: 12px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35); line-height: 1.4; font-size: 12px;
+      max-width: min(96vw, 520px);
+    }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .title { font-weight: 800; letter-spacing: .3px; font-size: 13px; }
+    .chip { padding: 4px 8px; border-radius: 999px; background: rgba(255,255,255,.1); font-weight: 700; }
+    button, select, input[type="number"] {
+      border-radius: 10px; border: 0; padding: 6px 10px; background: rgba(255,255,255,.18); color: #fff; font-weight: 600;
+    }
+    input[type="range"]{ width: 160px; }
+    .spacer{ flex: 1 1 8px; }
+    .bar { height: 8px; background: rgba(255,255,255,.18); border-radius: 999px; overflow: hidden; width: 100%; }
+    .bar > i { display: block; height: 100%; background: linear-gradient(90deg, #7dd3fc, #60a5fa); width: 0%; }
+    .muted{ opacity:.75 }
+  </style>
+</head>
+<body>
+  <!--
+    ocean-study-wave (Chicago Focus Timer)
+    -------------------------------------
+    • 勉強タイマー（Start / Pause / Reset, 目標分）
+    • シカゴ時間に合わせた実時間の昼夜変化（America/Chicago）
+    • もしくは“加速モード”：勉強時間の経過で 24h を巡る
+    • よりリアルな海：多オクターブPerlinノイズ、スペキュラ、泡の縁
+    • lofi波音：pink noise + lowpass + gentle reverb（ボタンでON）
+  -->
+
+  <div class="hud" id="hud">
+    <div class="row" style="margin-bottom:6px">
+      <span class="title">ocean-study-wave</span>
+      <span class="chip" id="tzChip">Chicago — <span id="tzClock">--:--:--</span></span>
+      <span class="spacer"></span>
+      <button id="audioBtn">🔈 Audio</button>
+      <button id="shotBtn">📸 Shot</button>
+    </div>
+
+    <div class="row" style="margin-bottom:6px">
+      <b>Study</b>
+      <button id="startBtn">Start</button>
+      <button id="pauseBtn">Pause</button>
+      <button id="resetBtn">Reset</button>
+      <span class="chip">⏱ <span id="elapsedLabel">00:00:00</span></span>
+      <span>Goal(min)</span>
+      <input id="goalMin" type="number" min="1" max="1440" value="60" style="width:72px"/>
+    </div>
+
+    <div class="row" style="margin-bottom:8px">
+      <div class="bar"><i id="goalBar"></i></div>
+    </div>
+
+    <div class="row">
+      <label><input type="checkbox" id="accelerate"> 加速モード（勉強時間で24h巡る）</label>
+      <span class="spacer"></span>
+      <span class="muted">Stars</span>
+      <button id="starsBtn">On/Off</button>
+      <span class="muted">Amp</span>
+      <input id="ampSlider" type="range" min="0.6" max="1.6" step="0.01" value="1" />
+      <span class="muted" id="ampVal">1.00×</span>
+      <span class="muted">Speed</span>
+      <input id="speedSlider" type="range" min="0.6" max="1.6" step="0.01" value="1" />
+      <span class="muted" id="speedVal">1.00×</span>
+    </div>
+  </div>
+
+  <script>
+    // ===== Time (America/Chicago) =======================================
+    const CHICAGO_TZ = 'America/Chicago';
+    const tzFmt = new Intl.DateTimeFormat('ja-JP', { timeZone: CHICAGO_TZ, hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    function chicagoNow(){ return new Date(); }
+    function chicagoClockStr(){ return tzFmt.format(chicagoNow()); }
+    function chicagoHourFloat(){
+      const d = chicagoNow();
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone: CHICAGO_TZ, hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'}).formatToParts(d);
+      const h = +parts.find(p=>p.type==='hour').value;
+      const m = +parts.find(p=>p.type==='minute').value;
+      const s = +parts.find(p=>p.type==='second').value;
+      return h + m/60 + s/3600;
+    }
+
+    // ===== Study Timer ===================================================
+    let studying = false, startAt = 0, pausedAccum = 0, pauseAt = 0;
+    function startStudy(){ if(!studying){ studying = true; startAt = performance.now(); pausedAccum=0; pauseAt=0; bootAudioOnUserGesture(); } }
+    function pauseStudy(){ if(studying){ studying=false; pauseAt=performance.now(); stopAudio(); } }
+    function resumeStudy(){ if(!studying){ studying=true; if(pauseAt){ pausedAccum += performance.now()-pauseAt; pauseAt=0; } bootAudioOnUserGesture(); } }
+    function resetStudy(){ studying=false; startAt=0; pausedAccum=0; pauseAt=0; stopAudio(); }
+    function elapsedMs(){ if(!startAt) return 0; const now=performance.now(); const active = studying? now : (pauseAt||now); return Math.max(0, active - startAt - pausedAccum); }
+
+    function fmtHMS(ms){ const s=Math.floor(ms/1000); const hh=String(Math.floor(s/3600)).padStart(2,'0'); const mm=String(Math.floor((s%3600)/60)).padStart(2,'0'); const ss=String(s%60).padStart(2,'0'); return `${hh}:${mm}:${ss}`; }
+
+    // ===== URL params (amp/speed/stars) =================================
+    function getParams(){ const p=new URLSearchParams(location.search); return { amp:+(p.get('amp')||1), speed:+(p.get('speed')||1), stars:(p.get('stars')??'1')!=='0' } }
+    function setParams(obj){ const p=new URLSearchParams(location.search); if(obj.amp!=null)p.set('amp',obj.amp.toFixed(2)); if(obj.speed!=null)p.set('speed',obj.speed.toFixed(2)); if(obj.stars!=null)p.set('stars',obj.stars?'1':'0'); history.replaceState({},'',location.pathname+'?'+p.toString()); }
+
+    // ===== Audio (lofi ocean) ===========================================
+    let pink, lp, reverb, audioOn=false, audioBooted=false;
+    function bootAudioOnUserGesture(){ if(audioBooted) return; try{
+        pink = new p5.Noise('pink');
+        lp = new p5.LowPass();
+        reverb = new p5.Reverb();
+        pink.disconnect(); pink.connect(lp); lp.disconnect(); lp.connect(reverb);
+        lp.freq(900); lp.res(1);
+        reverb.set(5, 2); // (reverb time, decay)
+        audioBooted=true; audioOn=false;
+      }catch(e){ console.warn('Audio boot failed',e); }
+      if(!audioOn) startAudio();
+    }
+    function startAudio(){ if(pink && !audioOn){ pink.start(); audioOn=true; } }
+    function stopAudio(){ if(pink && audioOn){ pink.stop(); audioOn=false; } }
+
+    // ===== Ocean Rendering ==============================================
+    // More realistic look: multi-octave noise + slope-based shading + specular
+    const BASE_LAYERS=[
+      { amp:22, len:420, speed:0.35, color:[16,74,120], alpha:230 },
+      { amp:32, len:300, speed:0.55, color:[10,60,110], alpha:240 },
+      { amp:46, len:230, speed:0.75, color:[6,44,90],  alpha:250 },
+      { amp:64, len:180, speed:0.95, color:[4,34,74],  alpha:255 },
+    ];
+    let LAYERS = BASE_LAYERS.map(l=>({...l}));
+
+    function scaleLayers(){
+      const a = +document.getElementById('ampSlider').value;
+      const s = +document.getElementById('speedSlider').value;
+      LAYERS = BASE_LAYERS.map(l=>({ ...l, amp: l.amp*a, speed: l.speed*s }));
+    }
+
+    let t=0, starsEnabled=true, stars=[];
+
+    function initStars(){
+      stars=[]; const desired=Math.floor((width*height)/12000);
+      for(let i=0;i<desired;i++) stars.push({x:random(width), y:random(height*0.65), s:random(0.6,1.8), p:random(TAU)});
+    }
+
+    function skyColors(h){
+      const c=(r,g,b)=>color(r,g,b);
+      const keys=[
+        { h:5,  top:c(12,18,48),  bottom:c(255,153,102), starA:150 },
+        { h:7,  top:c(86,142,212), bottom:c(170,208,255), starA:0   },
+        { h:12, top:c(60,130,210), bottom:c(185,225,255), starA:0   },
+        { h:17, top:c(70,120,200), bottom:c(255,190,150), starA:0   },
+        { h:19, top:c(18,24,56),   bottom:c(10,20,60),   starA:160 },
+        { h:24, top:c(10,16,40),   bottom:c(6,10,30),    starA:180 },
+      ];
+      keys.push({ ...keys[0], h:29 });
+      let hAdj=h; if(hAdj<keys[0].h) hAdj+=24; let i=0; while(!(hAdj>=keys[i].h && hAdj<=keys[i+1].h)) i++;
+      const k1=keys[i],k2=keys[i+1], f=map(hAdj,k1.h,k2.h,0,1,true);
+      return { top:lerpColor(k1.top,k2.top,f), bottom:lerpColor(k1.bottom,k2.bottom,f), starA:lerp(k1.starA,k2.starA,f) };
+    }
+
+    function horizonY(){ return height*0.62; }
+
+    function drawSkyAndStars(hour){
+      const {top,bottom,starA} = skyColors(hour);
+      for(let y=0;y<height;y++){ const f=y/height; const c=lerpColor(top,bottom,f); stroke(c); line(0,y,width,y); }
+      const hy=horizonY(); noStroke(); for(let i=0;i<120;i++){ fill(255,255,255,map(i,0,119,0,60)*0.35); rect(0,hy+i,width,1); }
+      if(starsEnabled){ for(const s of stars){ const tw=(sin((t*0.8 + s.p)) + 1)*0.5; const a=tw*starA; if(a>2){ fill(255,255,255,a); circle(s.x,s.y,s.s); } } }
+    }
+
+    function fnoise(x, t, l){ // fractal noise along a scanline
+      const k = TAU / l.len; const s = l.speed; let y=0, amp=1, fr=1; // FBM
+      for(let o=0;o<4;o++){ y += amp * noise(k*x*fr + t*s*fr); amp*=0.5; fr*=1.9; }
+      return (y-0.5) * 2 * l.amp; // center at 0
+    }
+
+    function drawLayer(idx){
+      const l=LAYERS[idx]; const hy=horizonY(); const baseY=hy + idx*40;
+      const body=color(l.color[0],l.color[1],l.color[2], l.alpha);
+      fill(body); beginShape(); vertex(0,height); vertex(0, baseY + fnoise(0,t,l));
+      const step=5; for(let x=0;x<=width;x+=step){ vertex(x, baseY + fnoise(x,t,l)); }
+      vertex(width,height); endShape(CLOSE);
+
+      // foam where curvature is high (simple second-derivative approx)
+      stroke(255,255,255,26+idx*6); noFill();
+      for(let x=0;x<width;x+=8){
+        const y1=baseY + fnoise(x-4,t,l), y2=baseY + fnoise(x,t,l), y3=baseY + fnoise(x+4,t,l);
+        const curv = abs(y1 - 2*y2 + y3);
+        if(curv>2.2) point(x, y2 - 1);
+      }
+      noStroke();
+
+      // specular sparkle (sun reflection feel)
+      const sparkleCount=120; for(let i=0;i<sparkleCount;i++){ const sx=noise(t*0.15+i*0.31)*width; const sy=baseY + noise(t*0.22+i*0.17)*16; fill(255,255,255,22); circle(sx,sy, noise(i*0.02)*2.2); }
+    }
+
+    // ===== Time driving (real vs accelerated) ============================
+    let accelerate=false; // if true: use elapsed study time mapped to 24h
+    function driveHour(){
+      if(!accelerate) return chicagoHourFloat();
+      const ms = elapsedMs(); const dayMs = 24*3600*1000; return (ms % dayMs) / 3600000; // 0..24
+    }
+
+    // ===== p5 lifecycle ==================================================
+    function setup(){ createCanvas(windowWidth, windowHeight); noStroke(); initStars(); setupUI(); frameRate(60); }
+    function windowResized(){ resizeCanvas(windowWidth, windowHeight); initStars(); }
+    function draw(){ t += deltaTime*0.002; drawSkyAndStars(driveHour()); for(let i=0;i<LAYERS.length;i++) drawLayer(i); updateUI(); }
+
+    // ===== UI wiring =====================================================
+    function setupUI(){
+      const tzClock=document.getElementById('tzClock');
+      const startBtn=document.getElementById('startBtn');
+      const pauseBtn=document.getElementById('pauseBtn');
+      const resetBtn=document.getElementById('resetBtn');
+      const elapsedLabel=document.getElementById('elapsedLabel');
+      const goalMin=document.getElementById('goalMin');
+      const bar=document.getElementById('goalBar');
+      const starsBtn=document.getElementById('starsBtn');
+      const shotBtn=document.getElementById('shotBtn');
+      const audioBtn=document.getElementById('audioBtn');
+      const amp=document.getElementById('ampSlider'); const ampVal=document.getElementById('ampVal');
+      const spd=document.getElementById('speedSlider'); const spdVal=document.getElementById('speedVal');
+      const accel=document.getElementById('accelerate');
+
+      setInterval(()=>{ tzClock.textContent = chicagoClockStr(); }, 500);
+
+      startBtn.addEventListener('click', ()=>{ if(!startAt) startStudy(); else resumeStudy(); });
+      pauseBtn.addEventListener('click', ()=> pauseStudy());
+      resetBtn.addEventListener('click', ()=>{ resetStudy(); elapsedLabel.textContent='00:00:00'; bar.style.width='0%'; });
+
+      starsBtn.addEventListener('click', ()=>{ starsEnabled=!starsEnabled; });
+      shotBtn.addEventListener('click', ()=> saveCanvas('ocean-study-wave','png'));
+      audioBtn.addEventListener('click', ()=>{ if(!audioBooted) bootAudioOnUserGesture(); else (audioOn? stopAudio():startAudio()); });
+
+      amp.addEventListener('input', ()=>{ ampVal.textContent=Number(amp.value).toFixed(2)+'×'; scaleLayers(); setParams({amp:+amp.value}); });
+      spd.addEventListener('input', ()=>{ spdVal.textContent=Number(spd.value).toFixed(2)+'×'; scaleLayers(); setParams({speed:+spd.value}); });
+      accel.addEventListener('change', ()=>{ accelerate=accel.checked; });
+
+      // load params
+      const p=getParams(); amp.value=p.amp||1; spd.value=p.speed||1; starsEnabled=!!p.stars; amp.dispatchEvent(new Event('input')); spd.dispatchEvent(new Event('input'));
+
+      // keys
+      window.addEventListener('keydown', (e)=>{
+        if(e.key===' '){ e.preventDefault(); if(studying) pauseStudy(); else if(!startAt) startStudy(); else resumeStudy(); }
+      });
+    }
+
+    function updateUI(){
+      const ms=elapsedMs(); document.getElementById('elapsedLabel').textContent=fmtHMS(ms);
+      const g= (+document.getElementById('goalMin').value || 60)*60*1000; const pct=Math.min(100, (ms/g)*100); document.getElementById('goalBar').style.width = pct+'%';
+    }
+  </script>
+</body>
+</html>
